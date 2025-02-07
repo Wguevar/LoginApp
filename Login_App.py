@@ -4,7 +4,18 @@ import re
 import datetime
 import cv2
 import os
-#from mtcnn.mtcnn import MTCNN
+import numpy as np
+from lpips.pretrained_networks import resnet
+from matplotlib import pyplot as plt
+from facenet_pytorch import MTCNN, InceptionResnetV1
+from PIL import Image
+import torch
+from pydantic_core.core_schema import none_schema
+
+# Cargar el modelo preentrenado
+mtcnn = MTCNN(keep_all=True)
+model = InceptionResnetV1(pretrained='casia-webface').eval()
+
 
 resultado_global = None
 id_usuario = None
@@ -12,8 +23,12 @@ nombre_usuario = None
 apellido_usuario = None
 
 # declaracion de rutas, una para el directorio y otro para la foto en especifico
-directorio = r"C:\Users\Wilmer\PycharmProjects\probando_flutter\foto_temporal"
-directorio_foto = r"C:\Users\Wilmer\PycharmProjects\probando_flutter\foto_temporal\foto.jpg"
+
+directorio_actual = os.path.dirname(os.path.abspath(__file__))
+print(f"directorio actual : '{directorio_actual}'")
+directorio = os.path.join(directorio_actual, 'foto_temporal')
+print(f"directorio foto : '{directorio}'")
+directorio_foto = os.path.join(directorio_actual, 'foto_temporal', 'foto.jpg')
 
 
 myconection = pymysql.connect(host='localhost', user='root', passwd='', db='empleados')
@@ -66,6 +81,153 @@ def create_body(page: ft.Page) -> ft.Control:
             page.snack_bar.open = True
             page.update()
 
+    # Función para cargar imágenes y extraer características
+    def cargar_imagenes():
+        cur.execute("SELECT codigo, foto FROM trabajadores")
+        fotos = cur.fetchall()
+        vectores = []
+
+
+        for codigo, foto_blob in fotos:
+            # Convertir el BLOB a una imagen
+            nparr = np.frombuffer(foto_blob, np.uint8)
+            imagen = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+            # Detectar el rostro
+            aligned_faces = mtcnn(imagen)
+
+            if aligned_faces is None:
+                print(f"No se detectó ningún rostro en la imagen del trabajador con código {codigo}.")
+                continue  # Cambiar a continue para seguir con el siguiente código
+
+            print(f"Se detectó un rostro en la imagen del trabajador con código {codigo}.")
+
+            if aligned_faces.dim() == 3:  # If only one face is detected
+                aligned_faces = aligned_faces.unsqueeze(0)  # Add batch dimension
+
+                # Obtener el embedding del rostro
+            embedding = model(aligned_faces).detach()
+            vectores.append((codigo, embedding))  # Almacenar el código y el embedding
+
+        return vectores
+
+    # Función para comparar una nueva imagen
+    def comparar_imagenes(face_log, vectores_trabajadores):
+        aligned_faces_log = mtcnn(face_log)
+
+
+        if aligned_faces_log is None:
+            print("No se detectó ningún rostro en la imagen capturada.")
+            return None
+
+        print("Se detectó un rostro en la imagen capturada.")
+
+        if aligned_faces_log.dim() == 3:  # If only one face is detected
+            aligned_faces_log= aligned_faces_log.unsqueeze(0)  # Add batch dimension
+
+            # Obtener el embedding del rostro
+        embedding_log = model(aligned_faces_log).detach()
+
+        for codigo, embedding_reg in vectores_trabajadores:
+            # Calcular la distancia euclidiana entre los embeddings
+            distancia = (embedding_log - embedding_reg).norm().item()
+            if distancia < 1.0:  # You can adjust the threshold for verification
+                return codigo  # Retornar el código del trabajador
+            else:
+                print("Different persons")
+
+        return None
+
+    def Camara_Login(e):
+        global id_usuario, nombre_usuario, apellido_usuario
+
+        # Abriendo la cámara
+        cap = cv2.VideoCapture(0)
+        cv2.namedWindow("Camara")
+
+        ruta_foto = os.path.join(directorio, "foto.jpg")
+
+        # Condicional en caso de que no exista el directorio donde se guardará la foto
+
+        if not os.path.exists(directorio):
+            page.snack_bar = ft.SnackBar(ft.Text("Directorio no encontrado", color="red"))
+            page.snack_bar.open = True
+            page.update()
+            return  # Salir de la función si el directorio no existe
+
+        while True:
+            # Capturar la foto
+            ret, frame = cap.read()
+
+            # Hacer una copia del frame para mostrar el mensaje
+            frame_con_mensaje = frame.copy()
+
+            # Ag regar el mensaje en la copia del frame
+            cv2.putText(frame_con_mensaje, "ESPACIO para tomar la foto, ESCAPE para salir",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 0, 0),
+                        2,
+                        cv2.LINE_AA)
+
+            # Mostrar el frame con el mensaje en la ventana
+            cv2.imshow("Camara", frame_con_mensaje)
+
+            # Esperar a que el usuario presione la tecla ESPACIO para tomar la foto
+            tecla = cv2.waitKey(1)
+            if tecla == 32:  # Tecla ESPACIO
+                # Guardar la imagen original sin el mensaje
+                cv2.imwrite(ruta_foto, frame)
+
+                page.snack_bar = ft.SnackBar(ft.Text("Foto guardada exitosamente", color="black"))
+                page.snack_bar.open = True
+                page.update()
+                break
+            # Salir si se presiona la tecla ESCAPE
+            elif tecla == 27:
+                break
+
+        # Quitar la cámara
+        cap.release()
+        cv2.destroyAllWindows()
+
+        # Cargar la imagen capturada
+        face_log = cv2.imread(ruta_foto)
+
+        # Cargar las imágenes de la base de datos
+        vectores_trabajadores = cargar_imagenes()
+
+        # Comparar la imagen capturada con las imágenes en la base de datos
+        codigo_encontrado = comparar_imagenes(face_log, vectores_trabajadores)
+
+        if codigo_encontrado:
+            # Si se encuentra una coincidencia, obtener el nombre y apellido
+            cur.execute(f'SELECT codigo, nombre, apellido FROM trabajadores WHERE codigo = "{codigo_encontrado}"')
+            resultado_global = cur.fetchone()
+
+            if resultado_global:
+                id_usuario = resultado_global[0]
+                nombre_usuario = resultado_global[1]
+                apellido_usuario = resultado_global[2]
+
+                ahora = datetime.datetime.now()
+                cur.execute(
+                    f'INSERT INTO registro_op (codigo, operacion, fecha) VALUES ("{id_usuario}", "INGRESO DE USUARIO FACE ID", "{ahora}");')
+                myconection.commit()
+
+                page.snack_bar = ft.SnackBar(ft.Text("¡Bienvenido!", color="green"))
+                page.snack_bar.open = True
+                page.update()
+                page.go("/Menu")
+        else:
+            page.snack_bar = ft.SnackBar(ft.Text("¡Error! No se encontraron coincidencias.", color="red"))
+            page.snack_bar.open = True
+            page.update()
+
+        # Borrar la imagen "foto.jpg" después de procesarla
+        if os.path.exists(ruta_foto):
+            os.remove(ruta_foto)
+
     return ft.Container(
         ft.Row([
             ft.Container(
@@ -114,7 +276,7 @@ def create_body(page: ft.Page) -> ft.Control:
                             ),
                             width=280,
                             bgcolor='orange',
-
+                            on_click=Camara_Login
                         ),
                         padding=ft.padding.only(25, 10)
                     ),
@@ -571,20 +733,20 @@ def main(page: ft.Page):
             import cv2
             import os
 
-            def camara(e):
-                # abriendo la camara
+            def camara_Registro(e):
+                # Abriendo la cámara
                 cap = cv2.VideoCapture(0)
                 cv2.namedWindow("Camara")
 
-                # condicional en caso de que no exista el directorio donde se guardara la foto
+                # Condicional en caso de que no exista el directorio donde se guardará la foto
                 if not os.path.exists(directorio):
                     page.snack_bar = ft.SnackBar(ft.Text("Directorio no encontrado", color="red"))
                     page.snack_bar.open = True
                     page.update()
-                    return  # salir de la función si el directorio no existe
+                    return  # Salir de la función si el directorio no existe
 
                 while True:
-                    # capturar la foto
+                    # Capturar la foto
                     ret, frame = cap.read()
 
                     # Hacer una copia del frame para mostrar el mensaje
@@ -601,22 +763,36 @@ def main(page: ft.Page):
                     # Mostrar el frame con el mensaje en la ventana
                     cv2.imshow("Camara", frame_con_mensaje)
 
-                    # esperar a que el usuario presione la tecla ESPACIO para tomar la foto
+                    # Esperar a que el usuario presione la tecla ESPACIO para tomar la foto
                     tecla = cv2.waitKey(1)
-                    if tecla == 32:
-                        # guardar la imagen original sin el mensaje
+                    if tecla == 32:  # Tecla ESPACIO
+                        # Guardar la imagen original sin el mensaje
                         ruta_foto = os.path.join(directorio, "foto.jpg")
                         cv2.imwrite(ruta_foto, frame)
 
-                        page.snack_bar = ft.SnackBar(ft.Text("Foto guardada exitosamente", color="black"))
-                        page.snack_bar.open = True
-                        page.update()
-                        break
-                    # salir si se presiona la tecla ESCAPE
+                        # Detectar rostros en la imagen
+                        faces = mtcnn(frame)
+
+                        # Verificar si se detectaron rostros
+                        if faces is None or len(faces) == 0:
+                            print("No se detectaron rostros. Eliminando la foto.")
+                            os.remove(ruta_foto)  # Eliminar la foto si no hay rostros
+                            page.snack_bar = ft.SnackBar(
+                                ft.Text("No se detectaron rostros. Foto eliminada.", color="red"))
+                            page.snack_bar.open = True
+                            page.update()
+                        else:
+                            # Si se detectan rostros, puedes continuar con el resto del programa
+                            page.snack_bar = ft.SnackBar(ft.Text("Foto guardada exitosamente", color="black"))
+                            page.snack_bar.open = True
+                            page.update()
+                            break  # Salir del bucle si se guardó la foto
+
+                    # Salir si se presiona la tecla ESCAPE
                     elif tecla == 27:
                         break
 
-                # quitar la cámara
+                # Quitar la cámara
                 cap.release()
                 cv2.destroyAllWindows()
 
@@ -697,6 +873,7 @@ def main(page: ft.Page):
                     ft.Text(f"Usuario registrado, su codigo es: {codigo}, inicie sesion para ingresar", color="black"))
                 page.snack_bar.open = True
                 page.update()
+                page.go("")
 
             text_field_nombre = ft.TextField(
                 width=280,
@@ -762,7 +939,7 @@ def main(page: ft.Page):
                                                 ),
                                                 width=320,
                                                 bgcolor='orange',
-                                                on_click=camara
+                                                on_click=camara_Registro
                                             ),
                                             padding=ft.padding.only(25, 10)
                                         ),
@@ -821,4 +998,4 @@ def main(page: ft.Page):
     page.on_route_change = route_change
     page.add(create_body(page))
 
-ft.app(target=main, view=ft.WEB_BROWSER)
+ft.app(target=main, view = WEB_BROWSER)
